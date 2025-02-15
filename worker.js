@@ -1,3 +1,10 @@
+// Global variables
+let STATUS_STORE;
+let pageRuleStatus = null;
+let pageRuleBackupStatus = null;
+let lastPageRuleCheck = 0;
+let lastCheckTime = 0;
+
 // Configuration
 const CONFIG = {
   apiEmail: 'your-email@gmail.com',
@@ -15,20 +22,34 @@ const CONFIG = {
   }
 };
 
-
-// Cache for page rule statuses
-let pageRuleStatus = null;
-let pageRuleBackupStatus = null;
-let lastPageRuleCheck = 0;
-let lastCheckTime = 0;
-
-// Biến lưu trạng thái thông báo cuối cùng
-let lastNotificationStatus = null; // 'UP' hoặc 'DOWN'
-
+// Utility function to delay
 async function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Get last notification status from KV
+async function getLastNotificationStatus() {
+  try {
+    const status = await STATUS_STORE.get('lastStatus');
+    return status || 'UP';
+  } catch (error) {
+    console.error('Failed to get last notification status:', error);
+    return 'UP';
+  }
+}
+
+// Update notification status in KV
+async function updateLastNotificationStatus(status) {
+  try {
+    await STATUS_STORE.put('lastStatus', status);
+    return true;
+  } catch (error) {
+    console.error('Failed to update notification status:', error);
+    return false;
+  }
+}
+
+// Send Telegram notification
 async function sendTelegramNotification(message) {
   try {
     const response = await fetch(
@@ -53,6 +74,7 @@ async function sendTelegramNotification(message) {
   }
 }
 
+// Check domain status
 async function checkDomainStatus(domain) {
   try {
     const controller = new AbortController();
@@ -71,6 +93,7 @@ async function checkDomainStatus(domain) {
   }
 }
 
+// Verify DOWN status
 async function verifyDownStatus() {
   let failCount = 0;
   
@@ -89,8 +112,8 @@ async function verifyDownStatus() {
   return failCount === CONFIG.maxRetries;
 }
 
+// Get page rules status
 async function getPageRulesStatus() {
-  // Use cache if recent
   if (pageRuleStatus !== null && pageRuleBackupStatus !== null && 
       Date.now() - lastPageRuleCheck < 30000) {
     return { main: pageRuleStatus, backup: pageRuleBackupStatus };
@@ -139,8 +162,8 @@ async function getPageRulesStatus() {
   }
 }
 
+// Update page rules
 async function updatePageRules(isDown) {
-  // Skip if statuses match desired states
   if (pageRuleStatus === isDown && pageRuleBackupStatus === !isDown) {
     return true;
   }
@@ -189,11 +212,13 @@ async function updatePageRules(isDown) {
   }
 }
 
+// Handle DOWN detection
 async function handleDownDetection(currentRules) {
   const isReallyDown = await verifyDownStatus();
   
-  // Chỉ gửi thông báo nếu trạng thái trước đó không phải là DOWN
-  if (isReallyDown && lastNotificationStatus !== 'DOWN') {
+  const lastStatus = await getLastNotificationStatus();
+  
+  if (isReallyDown && lastStatus !== 'DOWN') {
     const timestamp = new Date().toLocaleString('vi-VN', {
       timeZone: 'Asia/Ho_Chi_Minh',
       hour12: false
@@ -212,15 +237,22 @@ async function handleDownDetection(currentRules) {
       `➡️ Redirecting traffic to backup server`;
     
     await sendTelegramNotification(message);
-    lastNotificationStatus = 'DOWN'; // Cập nhật trạng thái thông báo cuối cùng
+    await updateLastNotificationStatus('DOWN');
     return true;
   }
   return false;
 }
 
+// Handle UP detection
 async function handleUpDetection(currentRules) {
-  // Chỉ gửi thông báo nếu trạng thái trước đó không phải là UP
-  if (lastNotificationStatus !== 'UP') {
+  const isReallyUp = await checkDomainStatus(CONFIG.targetDomain);
+  if (!isReallyUp) {
+    return false;
+  }
+
+  const lastStatus = await getLastNotificationStatus();
+  
+  if (lastStatus !== 'UP' && (currentRules.main || !currentRules.backup)) {
     const timestamp = new Date().toLocaleString('vi-VN', {
       timeZone: 'Asia/Ho_Chi_Minh',
       hour12: false
@@ -239,34 +271,37 @@ async function handleUpDetection(currentRules) {
       `➡️ Traffic restored to main server`;
     
     await sendTelegramNotification(message);
-    lastNotificationStatus = 'UP'; // Cập nhật trạng thái thông báo cuối cùng
+    await updateLastNotificationStatus('UP');
     return true;
   }
   return false;
 }
 
+// Sync page rules
 async function syncPageRules() {
   const currentRules = await getPageRulesStatus();
   const isUp = await checkDomainStatus(CONFIG.targetDomain);
 
   if (isUp) {
     if (currentRules.main || !currentRules.backup) {
-      await updatePageRules(false); // Đảm bảo Page Rule chính tắt và dự phòng bật
+      await updatePageRules(false);
     }
   } else {
     if (!currentRules.main || currentRules.backup) {
-      await updatePageRules(true); // Đảm bảo Page Rule chính bật và dự phòng tắt
+      await updatePageRules(true);
     }
   }
 }
 
+// Main monitor function
 async function monitor() {
-  await syncPageRules(); // Đồng bộ hóa trạng thái Page Rules khi bắt đầu
+  await syncPageRules();
   const startTime = Date.now();
   let currentRules = await getPageRulesStatus();
 
   while (Date.now() - startTime < CONFIG.maxExecutionTime) {
     const isUp = await checkDomainStatus(CONFIG.targetDomain);
+    currentRules = await getPageRulesStatus();
 
     if (!isUp) {
       const actionTaken = await handleDownDetection(currentRules);
@@ -288,24 +323,32 @@ async function monitor() {
   }
 }
 
-addEventListener('scheduled', event => {
-  event.waitUntil(monitor());
-});
-
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
-
+// Handle API request
 async function handleRequest(request) {
   const isUp = await checkDomainStatus(CONFIG.targetDomain);
   const rules = await getPageRulesStatus();
+  const lastStatus = await getLastNotificationStatus();
   
   return new Response(JSON.stringify({
     status: isUp ? 'up' : 'down',
     mainPageRuleEnabled: rules.main,
     backupPageRuleEnabled: rules.backup,
+    lastNotificationStatus: lastStatus,
     timestamp: new Date().toISOString()
   }), {
     headers: { 'Content-Type': 'application/json' }
   });
 }
+
+// Export the worker handlers
+export default {
+  async fetch(request, env, ctx) {
+    STATUS_STORE = env.NOTIFICATION_STATUS;
+    return await handleRequest(request);
+  },
+  
+  async scheduled(event, env, ctx) {
+    STATUS_STORE = env.NOTIFICATION_STATUS;
+    ctx.waitUntil(monitor());
+  }
+};
