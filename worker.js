@@ -1,6 +1,5 @@
 // Configuration
 const CONFIG = {
-const CONFIG = {
   apiEmail: 'your-email@gmail.com',
   apiKey: 'your-cloudflare-api-key',
   zoneId: 'your-cloudflare-zone-id',
