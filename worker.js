@@ -56,9 +56,7 @@ async function sendTelegramNotification(message) {
       `https://api.telegram.org/bot${CONFIG.telegram.botToken}/sendMessage`,
       {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           chat_id: CONFIG.telegram.chatId,
           text: message,
@@ -85,7 +83,7 @@ async function checkDomainStatus(domain) {
       headers: { 'User-Agent': 'Cloudflare-Worker-Monitor' },
       signal: controller.signal
     });
-    
+
     clearTimeout(timeoutId);
     return response.status >= 200 && response.status < 500;
   } catch {
@@ -93,10 +91,10 @@ async function checkDomainStatus(domain) {
   }
 }
 
-// Verify DOWN status
+// Verify DOWN status with retries
 async function verifyDownStatus() {
   let failCount = 0;
-  
+
   for (let i = 0; i < CONFIG.maxRetries; i++) {
     const isUp = await checkDomainStatus(CONFIG.targetDomain);
     if (!isUp) {
@@ -108,14 +106,28 @@ async function verifyDownStatus() {
       await delay(CONFIG.retryDelay);
     }
   }
-  
+
   return failCount === CONFIG.maxRetries;
 }
 
-// Get page rules status
+// Parse API response safely
+async function parseJSON(response) {
+  const text = await response.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    console.error('API returned non-JSON:', text);
+    return null;
+  }
+}
+
+// Get page rules status (cached 30s)
 async function getPageRulesStatus() {
-  if (pageRuleStatus !== null && pageRuleBackupStatus !== null && 
-      Date.now() - lastPageRuleCheck < 30000) {
+  if (
+    pageRuleStatus !== null &&
+    pageRuleBackupStatus !== null &&
+    Date.now() - lastPageRuleCheck < 30000
+  ) {
     return { main: pageRuleStatus, backup: pageRuleBackupStatus };
   }
 
@@ -142,22 +154,29 @@ async function getPageRulesStatus() {
         }
       )
     ]);
-    
+
     const [mainData, backupData] = await Promise.all([
-      mainResponse.json(),
-      backupResponse.json()
+      parseJSON(mainResponse),
+      parseJSON(backupResponse)
     ]);
 
-    pageRuleStatus = mainData.result.status === 'active';
-    pageRuleBackupStatus = backupData.result.status === 'active';
-    lastPageRuleCheck = Date.now();
-    
-    return { main: pageRuleStatus, backup: pageRuleBackupStatus };
+    if (mainData?.result && backupData?.result) {
+      pageRuleStatus = mainData.result.status === 'active';
+      pageRuleBackupStatus = backupData.result.status === 'active';
+      lastPageRuleCheck = Date.now();
+    } else {
+      console.error('Invalid API response, using cached values');
+    }
+
+    return {
+      main: pageRuleStatus ?? false,
+      backup: pageRuleBackupStatus ?? false
+    };
   } catch (error) {
     console.error('Failed to get page rules status:', error);
-    return { 
-      main: pageRuleStatus ?? false, 
-      backup: pageRuleBackupStatus ?? false 
+    return {
+      main: pageRuleStatus ?? false,
+      backup: pageRuleBackupStatus ?? false
     };
   }
 }
@@ -179,9 +198,7 @@ async function updatePageRules(isDown) {
             'X-Auth-Key': CONFIG.apiKey,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            status: isDown ? 'active' : 'disabled'
-          })
+          body: JSON.stringify({ status: isDown ? 'active' : 'disabled' })
         }
       ),
       fetch(
@@ -193,13 +210,11 @@ async function updatePageRules(isDown) {
             'X-Auth-Key': CONFIG.apiKey,
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({
-            status: isDown ? 'disabled' : 'active'
-          })
+          body: JSON.stringify({ status: isDown ? 'disabled' : 'active' })
         }
       )
     ]);
-    
+
     if (mainResponse.ok && backupResponse.ok) {
       pageRuleStatus = isDown;
       pageRuleBackupStatus = !isDown;
@@ -213,106 +228,98 @@ async function updatePageRules(isDown) {
 }
 
 // Handle DOWN detection
-async function handleDownDetection(currentRules) {
-  const isReallyDown = await verifyDownStatus();
-  
+async function handleDownDetection() {
+  // Check lastStatus TRƯỚC để tránh verifyDownStatus() chạy 9s mỗi iteration khi đã DOWN
   const lastStatus = await getLastNotificationStatus();
-  
-  if (isReallyDown && lastStatus !== 'DOWN') {
-    const timestamp = new Date().toLocaleString('vi-VN', {
-      timeZone: 'Asia/Ho_Chi_Minh',
-      hour12: false
-    });
-    
-    console.log(`${CONFIG.targetDomain} is confirmed down. Updating Page Rules...`);
-    
-    const rulesUpdated = await updatePageRules(true);
-    
-    const message = `⚠️ <b>Website Down Alert</b>\n\n` +
-      `Domain: ${CONFIG.targetDomain}\n` +
-      `Status: DOWN\n` +
-      `Time: ${timestamp}\n` +
-      `Action: Main Page Rule ${rulesUpdated ? 'enabled' : 'failed to enable'}, ` +
-      `Backup Page Rule ${rulesUpdated ? 'disabled' : 'failed to disable'}\n\n` +
-      `➡️ Redirecting traffic to backup server`;
-    
-    await sendTelegramNotification(message);
-    await updateLastNotificationStatus('DOWN');
-    return true;
-  }
-  return false;
+  if (lastStatus === 'DOWN') return false;
+
+  const isReallyDown = await verifyDownStatus();
+  if (!isReallyDown) return false;
+
+  const timestamp = new Date().toLocaleString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    hour12: false
+  });
+
+  console.log(`${CONFIG.targetDomain} is confirmed down. Updating Page Rules...`);
+
+  const rulesUpdated = await updatePageRules(true);
+
+  const message =
+    `⚠️ <b>Website Down Alert</b>\n\n` +
+    `Domain: ${CONFIG.targetDomain}\n` +
+    `Status: DOWN\n` +
+    `Time: ${timestamp}\n` +
+    `Action: Main Page Rule ${rulesUpdated ? 'enabled' : 'failed to enable'}, ` +
+    `Backup Page Rule ${rulesUpdated ? 'disabled' : 'failed to disable'}\n\n` +
+    `➡️ Redirecting traffic to backup server`;
+
+  await sendTelegramNotification(message);
+  await updateLastNotificationStatus('DOWN');
+  return true;
 }
 
 // Handle UP detection
-async function handleUpDetection(currentRules) {
-  const isReallyUp = await checkDomainStatus(CONFIG.targetDomain);
-  if (!isReallyUp) {
-    return false;
-  }
-
+async function handleUpDetection() {
+  // Check lastStatus TRƯỚC, bỏ điều kiện currentRules để fix recovery bug giữa 2 run
   const lastStatus = await getLastNotificationStatus();
-  
-  if (lastStatus !== 'UP' && (currentRules.main || !currentRules.backup)) {
-    const timestamp = new Date().toLocaleString('vi-VN', {
-      timeZone: 'Asia/Ho_Chi_Minh',
-      hour12: false
-    });
-    
-    console.log(`${CONFIG.targetDomain} is up. Updating Page Rules...`);
-    
-    const rulesUpdated = await updatePageRules(false);
-    
-    const message = `✅ <b>Website Recovery Alert</b>\n\n` +
-      `Domain: ${CONFIG.targetDomain}\n` +
-      `Status: UP\n` +
-      `Time: ${timestamp}\n` +
-      `Action: Main Page Rule ${rulesUpdated ? 'disabled' : 'failed to disable'}, ` +
-      `Backup Page Rule ${rulesUpdated ? 'enabled' : 'failed to enable'}\n\n` +
-      `➡️ Traffic restored to main server`;
-    
-    await sendTelegramNotification(message);
-    await updateLastNotificationStatus('UP');
-    return true;
-  }
-  return false;
+  if (lastStatus === 'UP') return false;
+
+  const isReallyUp = await checkDomainStatus(CONFIG.targetDomain);
+  if (!isReallyUp) return false;
+
+  const timestamp = new Date().toLocaleString('vi-VN', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    hour12: false
+  });
+
+  console.log(`${CONFIG.targetDomain} is up. Updating Page Rules...`);
+
+  const rulesUpdated = await updatePageRules(false);
+
+  const message =
+    `✅ <b>Website Recovery Alert</b>\n\n` +
+    `Domain: ${CONFIG.targetDomain}\n` +
+    `Status: UP\n` +
+    `Time: ${timestamp}\n` +
+    `Action: Main Page Rule ${rulesUpdated ? 'disabled' : 'failed to disable'}, ` +
+    `Backup Page Rule ${rulesUpdated ? 'enabled' : 'failed to enable'}\n\n` +
+    `➡️ Traffic restored to main server`;
+
+  await sendTelegramNotification(message);
+  await updateLastNotificationStatus('UP');
+  return true;
 }
 
-// Sync page rules
+// Sync page rules với thực tế khi worker mới start
 async function syncPageRules() {
-  const currentRules = await getPageRulesStatus();
   const isUp = await checkDomainStatus(CONFIG.targetDomain);
 
   if (isUp) {
-    if (currentRules.main || !currentRules.backup) {
+    const rules = await getPageRulesStatus();
+    if (rules.main || !rules.backup) {
       await updatePageRules(false);
     }
   } else {
-    if (!currentRules.main || currentRules.backup) {
+    const rules = await getPageRulesStatus();
+    if (!rules.main || rules.backup) {
       await updatePageRules(true);
     }
   }
 }
 
-// Main monitor function
+// Main monitor loop
 async function monitor() {
   await syncPageRules();
   const startTime = Date.now();
-  let currentRules = await getPageRulesStatus();
 
   while (Date.now() - startTime < CONFIG.maxExecutionTime) {
     const isUp = await checkDomainStatus(CONFIG.targetDomain);
-    currentRules = await getPageRulesStatus();
 
     if (!isUp) {
-      const actionTaken = await handleDownDetection(currentRules);
-      if (actionTaken) {
-        currentRules = { main: true, backup: false };
-      }
+      await handleDownDetection();
     } else {
-      const actionTaken = await handleUpDetection(currentRules);
-      if (actionTaken) {
-        currentRules = { main: false, backup: true };
-      }
+      await handleUpDetection();
     }
 
     const elapsed = Date.now() - lastCheckTime;
@@ -323,30 +330,31 @@ async function monitor() {
   }
 }
 
-// Handle API request
+// Handle API request (HTTP fetch)
 async function handleRequest(request) {
   const isUp = await checkDomainStatus(CONFIG.targetDomain);
   const rules = await getPageRulesStatus();
   const lastStatus = await getLastNotificationStatus();
-  
-  return new Response(JSON.stringify({
-    status: isUp ? 'up' : 'down',
-    mainPageRuleEnabled: rules.main,
-    backupPageRuleEnabled: rules.backup,
-    lastNotificationStatus: lastStatus,
-    timestamp: new Date().toISOString()
-  }), {
-    headers: { 'Content-Type': 'application/json' }
-  });
+
+  return new Response(
+    JSON.stringify({
+      status: isUp ? 'up' : 'down',
+      mainPageRuleEnabled: rules.main,
+      backupPageRuleEnabled: rules.backup,
+      lastNotificationStatus: lastStatus,
+      timestamp: new Date().toISOString()
+    }),
+    { headers: { 'Content-Type': 'application/json' } }
+  );
 }
 
-// Export the worker handlers
+// Export worker handlers
 export default {
   async fetch(request, env, ctx) {
     STATUS_STORE = env.NOTIFICATION_STATUS;
     return await handleRequest(request);
   },
-  
+
   async scheduled(event, env, ctx) {
     STATUS_STORE = env.NOTIFICATION_STATUS;
     ctx.waitUntil(monitor());
